@@ -42,6 +42,8 @@
 | `/gsd remote` | Control remote auto-mode |
 | `/gsd help` | Categorized command reference with descriptions for all GSD subcommands |
 
+`/gsd discuss` supports optional direct targets: `/gsd discuss M014`, `/gsd discuss M014/S03`, `/gsd discuss --milestone M014`, and `/gsd discuss --slice M014/S03`.
+
 ## Visual Briefs
 
 `/gsd brief` asks the agent to gather evidence and write a single responsive HTML artifact for visual review, planning, recap, or presentation. Usage:
@@ -75,7 +77,7 @@ After writing the file, GSD attempts to open it in a browser using the local pla
 | `/gsd keys` | API key manager — list, add, remove, test, rotate, doctor |
 | `/gsd doctor` | Runtime health checks with auto-fix — issues surface in real time across widget, visualizer, and HTML reports (v2.40) |
 | `/gsd inspect` | Show SQLite DB diagnostics |
-| `/gsd init` | Project init wizard — detect, configure, bootstrap `.gsd/` |
+| `/gsd init` | Project init wizard — detect, configure, bootstrap `.gsd/`; if `.gsd/` already exists, opens an "Already Initialized" menu with `Re-configure preferences`, `Suggest & install skills`, or `Cancel` |
 | `/gsd setup` | Global setup status and configuration |
 | `/gsd skill-health` | Skill lifecycle dashboard — usage stats, success rates, token trends, staleness warnings |
 | `/gsd skill-health <name>` | Detailed view for a single skill |

@@ -336,7 +336,7 @@ test("runDispatch checks prior-slice completion against the project root in work
   ]);
 });
 
-test("runDispatch pauses when complete-milestone summary exists on disk but the unit is still stuck (#4289)", async (t) => {
+test("runDispatch retries when complete-milestone summary exists on disk and stuck recovery can proceed (#4289)", async (t) => {
   const capture = createEventCapture();
   let pauseCalls = 0;
   let stopCalls = 0;
@@ -399,10 +399,9 @@ test("runDispatch pauses when complete-milestone summary exists on disk but the 
     consecutiveFinalizeTimeouts: 0,
   });
 
-  assert.equal(result.action, "break");
-  assert.equal((result as any).reason, "complete-milestone-artifact-db-mismatch");
-  assert.equal(pauseCalls, 1, "complete-milestone disk/db mismatch should pause auto-mode");
-  assert.equal(stopCalls, 0, "mismatch pause should not hard-stop the loop");
+  assert.equal(result.action, "continue");
+  assert.equal(pauseCalls, 0, "artifact-based recovery should retry before pausing");
+  assert.equal(stopCalls, 0, "artifact-based recovery should not hard-stop the loop");
 });
 
 test("runDispatch pauses when execute-task artifacts exist but DB status is still open", async (t) => {
@@ -636,7 +635,7 @@ test("runDispatch clears execute-task stuck state when artifacts and DB status a
   assert.equal(stopCalls, 0, "closed DB task should not hard-stop the loop");
   assert.equal(invalidateCalls, 1, "closed DB task recovery should invalidate caches once");
   assert.deepEqual(loopState.recentUnits, [], "closed DB task recovery should clear the stuck window");
-  assert.equal(loopState.stuckRecoveryAttempts, 0, "closed DB task recovery should reset the recovery counter");
+  assert.equal(loopState.stuckRecoveryAttempts, 1, "closed DB task recovery should preserve the recovery counter");
 });
 
 test("runDispatch clears stuck state after Level 1 artifact recovery", async (t) => {
@@ -703,7 +702,7 @@ test("runDispatch clears stuck state after Level 1 artifact recovery", async (t)
   assert.equal(invalidateCalls, 1, "Level 1 artifact recovery should invalidate caches");
   assert.equal(stopCalls, 0, "Level 1 artifact recovery should not hard-stop");
   assert.deepEqual(loopState.recentUnits, [], "Level 1 artifact recovery should clear the stuck window");
-  assert.equal(loopState.stuckRecoveryAttempts, 0, "Level 1 artifact recovery should reset the recovery counter");
+  assert.equal(loopState.stuckRecoveryAttempts, 1, "Level 1 artifact recovery should preserve the recovery counter");
 });
 
 test("runDispatch escapes Level 2 stuck stop when artifact verifies after cache invalidation", async (t) => {
@@ -770,7 +769,7 @@ test("runDispatch escapes Level 2 stuck stop when artifact verifies after cache 
   assert.equal(invalidateCalls, 1, "Level 2 escape should invalidate caches before rechecking artifacts");
   assert.equal(stopCalls, 0, "verified artifacts should escape Level 2 hard stop");
   assert.deepEqual(loopState.recentUnits, [], "Level 2 artifact escape should clear the stuck window");
-  assert.equal(loopState.stuckRecoveryAttempts, 0, "Level 2 artifact escape should reset the recovery counter");
+  assert.equal(loopState.stuckRecoveryAttempts, 1, "Level 2 artifact escape should preserve the recovery counter");
 });
 
 test("runUnitPhase emits unit-start and unit-end with causedBy reference", async () => {
@@ -828,7 +827,7 @@ test("runUnitPhase emits unit-start and unit-end with causedBy reference", async
   assert.equal(endEvents[0].flowId, ic.flowId);
   assert.equal((endEvents[0].data as any).unitType, "execute-task");
   assert.equal((endEvents[0].data as any).unitId, "M001/S01/T01");
-  assert.equal((endEvents[0].data as any).status, "completed");
+  assert.equal((endEvents[0].data as any).status, "no-artifact");
 
   // Verify causedBy: unit-end references unit-start's seq
   assert.ok(endEvents[0].causedBy, "unit-end must have a causedBy reference");
