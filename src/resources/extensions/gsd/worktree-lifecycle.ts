@@ -23,6 +23,7 @@ import { join } from "node:path";
 
 import type { AutoSession } from "./auto/session.js";
 import { debugLog } from "./debug-logger.js";
+import { logWarning } from "./workflow-logger.js";
 import { emitJournalEvent } from "./journal.js";
 import { emitWorktreeCreated, emitWorktreeMerged } from "./worktree-telemetry.js";
 import {
@@ -75,6 +76,13 @@ import {
   isInAutoWorktree,
   teardownAutoWorktree,
 } from "./auto-worktree.js";
+
+const recentWorktreeMergeFailures = new Map<string, number>();
+const MERGE_FAILURE_DEDUPE_MS = 60_000;
+
+export function resetRecentWorktreeMergeFailuresForTest(): void {
+  recentWorktreeMergeFailures.clear();
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -289,7 +297,7 @@ type WorktreeLifecyclePrimitiveOverrides = {
   teardownAutoWorktree?: (
     basePath: string,
     milestoneId: string,
-    opts?: { preserveBranch?: boolean },
+    opts?: { preserveBranch?: boolean; preserveWorktree?: boolean },
   ) => void;
   createAutoWorktree?: (basePath: string, milestoneId: string) => string;
   enterAutoWorktree?: (basePath: string, milestoneId: string) => string;
@@ -375,11 +383,16 @@ function lifecycleAutoWorktreeBranch(
     autoWorktreeBranch(milestoneId);
 }
 
+/**
+ * Dispatch teardown to the override registered in `deps`, or fall back to
+ * the real `teardownAutoWorktree`. Centralises testability: tests inject an
+ * override; production code uses the real implementation transparently.
+ */
 function lifecycleTeardownAutoWorktree(
   deps: WorktreeLifecycleDeps,
   basePath: string,
   milestoneId: string,
-  opts?: { preserveBranch?: boolean },
+  opts?: { preserveBranch?: boolean; preserveWorktree?: boolean },
 ): void {
   const override = primitiveOverrides(deps).teardownAutoWorktree;
   if (override) {
@@ -513,19 +526,9 @@ export function _enterMilestoneCore(
     };
   }
 
-  if (s.isolationDegraded) {
-    debugLog("WorktreeLifecycle", {
-      action: "enterMilestone",
-      milestoneId,
-      skipped: true,
-      reason: "isolation-degraded",
-    });
-    return { ok: false, reason: "isolation-degraded" };
-  }
-
   // Phase B: claim a milestone lease before any worktree mutation. Two
   // workers cannot enter the same milestone concurrently. Best-effort:
-  // skip if no worker registered (single-worker fallback) or DB
+  // warn if no worker registered (single-worker fallback) or skip if DB
   // unavailable; reuse existing lease if we already hold it on this
   // milestone (re-entry within the same session).
   if (s.workerId) {
@@ -618,6 +621,11 @@ export function _enterMilestoneCore(
         });
       }
     }
+  } else {
+    logWarning(
+      "worktree",
+      `enterMilestone(${milestoneId}) ran before auto worker registration; milestone lease was not claimed.`,
+    );
   }
 
   // Resolve the project root for worktree operations via shared helper.
@@ -625,6 +633,38 @@ export function _enterMilestoneCore(
   // a worktree path — prevents double-nested worktree paths (#3729).
   const basePath = resolveWorktreeProjectRoot(s.basePath, s.originalBasePath);
   const mode = getIsolationMode(basePath);
+
+  if (s.isolationDegraded) {
+    if (mode === "worktree") {
+      try {
+        lifecycleEnterBranchMode(deps, basePath, milestoneId);
+        s.basePath = basePath;
+        rebuildGitService(s, deps);
+        invalidateAllCaches();
+        ctx.notify(
+          `Worktree isolation is degraded. Fell back to branch milestone/${milestoneId}.`,
+          "warning",
+        );
+        return { ok: true, mode: "branch", path: basePath };
+      } catch (err) {
+        debugLog("WorktreeLifecycle", {
+          action: "enterMilestone",
+          milestoneId,
+          skipped: true,
+          reason: "isolation-degraded",
+          fallback: "branch-failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    debugLog("WorktreeLifecycle", {
+      action: "enterMilestone",
+      milestoneId,
+      skipped: true,
+      reason: "isolation-degraded",
+    });
+    return { ok: false, reason: "isolation-degraded" };
+  }
 
   if (mode === "none") {
     debugLog("WorktreeLifecycle", {
@@ -806,8 +846,8 @@ export function _enterMilestoneCore(
 /**
  * Resolve the basePath to adopt on resume from a paused session.
  *
- * Returns `persistedWorktreePath` when the path is non-null and exists on
- * disk; otherwise falls back to `base`. Used by
+ * Returns `persistedWorktreePath` when the path is non-null and still points
+ * at a git worktree; otherwise falls back to `base`. Used by
  * `WorktreeLifecycle.resumeFromPausedSession` (#5621). Exported as a pure
  * function so unit tests can exercise the path-resolution logic without
  * constructing a `WorktreeLifecycle` instance.
@@ -820,9 +860,26 @@ export function resolvePausedResumeBasePath(
   persistedWorktreePath: string | null | undefined,
   pathExists: (p: string) => boolean = existsSync,
 ): string {
-  return persistedWorktreePath && pathExists(persistedWorktreePath)
+  return persistedWorktreePath &&
+    isValidPersistedWorktreePath(persistedWorktreePath, pathExists)
     ? persistedWorktreePath
     : base;
+}
+
+function isValidPersistedWorktreePath(
+  persistedWorktreePath: string,
+  pathExists: (p: string) => boolean,
+): boolean {
+  if (!pathExists(persistedWorktreePath)) return false;
+
+  const gitPath = join(persistedWorktreePath, ".git");
+  if (!pathExists(gitPath)) return false;
+
+  try {
+    return readFileSync(gitPath, "utf8").trim().startsWith("gitdir: ");
+  } catch {
+    return false;
+  }
 }
 
 function rebuildGitService(
@@ -834,6 +891,32 @@ function rebuildGitService(
   // sees the constructor shape, the gitConfig type, or the unknown→
   // GitService cast.
   s.gitService = deps.gitServiceFactory(s.basePath);
+}
+
+function emitWorktreeMergeFailedOnce(
+  basePath: string,
+  milestoneId: string,
+  err: unknown,
+): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  const errorCategory = err instanceof Error ? err.name : "Error";
+  const now = Date.now();
+  const key = `${basePath}\0${milestoneId}\0${errorCategory}`;
+  const previous = recentWorktreeMergeFailures.get(key);
+  if (previous && now - previous < MERGE_FAILURE_DEDUPE_MS) return;
+  for (const [candidate, ts] of recentWorktreeMergeFailures) {
+    if (now - ts >= MERGE_FAILURE_DEDUPE_MS) {
+      recentWorktreeMergeFailures.delete(candidate);
+    }
+  }
+  emitJournalEvent(basePath, {
+    ts: new Date().toISOString(),
+    flowId: randomUUID(),
+    seq: 0,
+    eventType: "worktree-merge-failed",
+    data: { milestoneId, error: msg },
+  });
+  recentWorktreeMergeFailures.set(key, now);
 }
 
 // ─── Session-less merge entry (ADR-016 phase 2 / A1) ─────────────────────
@@ -985,13 +1068,7 @@ function _mergeWorktreeModeImpl(
       error: msg,
       fallback: "chdir-to-project-root",
     });
-    emitJournalEvent(originalBasePath || worktreeBasePath, {
-      ts: new Date().toISOString(),
-      flowId: randomUUID(),
-      seq: 0,
-      eventType: "worktree-merge-failed",
-      data: { milestoneId, error: msg },
-    });
+    emitWorktreeMergeFailedOnce(originalBasePath || worktreeBasePath, milestoneId, err);
     // Surface a clear, actionable error. Worktree and milestone branch
     // are intentionally preserved — nothing has been deleted. User can
     // retry /gsd dispatch complete-milestone or merge manually once the
@@ -1181,6 +1258,11 @@ export function mergeMilestoneStandalone(
 ): MergeStandaloneResult {
   const { originalBasePath, worktreeBasePath, milestoneId, notify } = mctx;
   validateMilestoneId(milestoneId);
+  if (!originalBasePath && !worktreeBasePath) {
+    throw new Error(
+      `Internal error: mergeMilestoneStandalone(${milestoneId}) requires originalBasePath or worktreeBasePath.`,
+    );
+  }
 
   if (mctx.isolationDegraded) {
     if (originalBasePath) {
@@ -1341,7 +1423,7 @@ export class WorktreeLifecycle {
    */
   exitMilestone(
     milestoneId: string,
-    opts: { merge: boolean; preserveBranch?: boolean },
+    opts: { merge: boolean; preserveBranch?: boolean; preserveWorktree?: boolean },
     ctx: NotifyCtx,
   ): ExitResult {
     if (opts.merge) {
@@ -1362,6 +1444,7 @@ export class WorktreeLifecycle {
     try {
       this._exitWithoutMerge(milestoneId, ctx, {
         preserveBranch: opts.preserveBranch,
+        preserveWorktree: opts.preserveWorktree,
       });
       return { ok: true, merged: false, codeFilesChanged: false };
     } catch (err) {
@@ -1425,10 +1508,15 @@ export class WorktreeLifecycle {
 
   // ── Private — exit without merge ─────────────────────────────────────
 
+  /**
+   * Auto-commit and tear down the worktree without merging to main.
+   * When `opts.preserveWorktree` is true the worktree directory is left on
+   * disk (slice-parallel dispatch keeps the parent worktree for re-entry).
+   */
   private _exitWithoutMerge(
     milestoneId: string,
     ctx: NotifyCtx,
-    opts: { preserveBranch?: boolean },
+    opts: { preserveBranch?: boolean; preserveWorktree?: boolean },
   ): void {
     validateMilestoneId(milestoneId);
     if (!lifecycleIsInAutoWorktree(this.deps, this.s.basePath)) {
@@ -1484,6 +1572,7 @@ export class WorktreeLifecycle {
     try {
       lifecycleTeardownAutoWorktree(this.deps, this.s.originalBasePath, milestoneId, {
         preserveBranch: opts.preserveBranch ?? false,
+        preserveWorktree: opts.preserveWorktree ?? false,
       });
     } catch (err) {
       teardownFailed = true;
@@ -1702,16 +1791,34 @@ export class WorktreeLifecycle {
   }
 
   /**
-   * Restore `s.basePath` to `s.originalBasePath` and rebuild `s.gitService`.
-   * No-op when `originalBasePath` is empty (fresh sessions).
+   * Restore `s.basePath` to `s.originalBasePath`, chdir process cwd, and
+   * rebuild `s.gitService`. No-op when `originalBasePath` is empty (fresh
+   * sessions).
    *
    * Used by error/cleanup paths that need the session to behave as if the
    * worktree was never entered. Does NOT teardown the worktree directory —
    * callers that need teardown go through `exitMilestone({ merge: false })`.
+   *
+   * ADR-016 phase 3 (#5693): chdir lives inside the verb so callers do not
+   * pair `restoreToProjectRoot()` with a redundant `process.chdir`. The
+   * chdir runs BEFORE the throwable work (`rebuildGitService`, cache
+   * invalidation) so that cleanup-path cwd is restored even if the
+   * downstream rebuild throws. The chdir itself is best-effort; failure is
+   * logged via debugLog and swallowed.
    */
   restoreToProjectRoot(): void {
     if (!this.s.originalBasePath) return;
     this.s.basePath = this.s.originalBasePath;
+    try {
+      process.chdir(this.s.basePath);
+    } catch (err) {
+      debugLog("WorktreeLifecycle", {
+        action: "restoreToProjectRoot",
+        result: "chdir-failed",
+        basePath: this.s.basePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     rebuildGitService(this.s, this.deps);
     invalidateAllCaches();
   }
